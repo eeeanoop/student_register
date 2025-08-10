@@ -9,6 +9,8 @@ import numpy as np
 from PIL import Image, ImageTk
 import pyttsx3
 
+from embeddings import compare_embeddings, compute_embedding, load_embeddings
+
 
 class StudentRegisterApp:
     """Simple student register using OpenCV's LBPH recognizer.
@@ -30,6 +32,10 @@ class StudentRegisterApp:
         self.names: List[str] = []
         self.image_paths: Dict[str, str] = {}
         self._train_recognizer()
+
+        # Pre-compute embeddings for optional secondary verification
+        self.embeddings = load_embeddings("student_images")
+        self.embedding_cutoff = 0.6
 
         # --- Video capture and UI ---
         self.cap = cv2.VideoCapture(0)
@@ -150,13 +156,32 @@ class StudentRegisterApp:
                 for (x, y, w, h) in faces:
                     roi = gray[y : y + h, x : x + w]
                     label, confidence = self.recognizer.predict(roi)
+                    verified = False
                     if confidence < 80:
                         name = self.names[label]
-                        if name not in self.recognized:
-                            self.recognized.add(name)
-                            self._speak(name)
-                        color = (0, 255, 0)
-                        cv2.putText(display, name, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                        # Optional embedding verification
+                        if self.embeddings:
+                            cropped = frame[y : y + h, x : x + w]
+                            emb = compute_embedding(cropped)
+                            stored = self.embeddings.get(name)
+                            if emb is not None and stored is not None:
+                                dist = compare_embeddings(emb, stored)
+                                verified = dist < self.embedding_cutoff
+                        else:
+                            verified = True
+
+                        if verified:
+                            if name not in self.recognized:
+                                self.recognized.add(name)
+                                self._speak(name)
+                            color = (0, 255, 0)
+                            cv2.putText(display, name, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                        else:
+                            color = (0, 0, 255)
+                            if time.time() - self.last_unauthorized > 5:
+                                self._speak("unauthorized")
+                                self.last_unauthorized = time.time()
+                            cv2.putText(display, "Unknown", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                     else:
                         color = (0, 0, 255)
                         if time.time() - self.last_unauthorized > 5:
