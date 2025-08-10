@@ -1,266 +1,192 @@
 import tkinter as tk
 from tkinter import messagebox
-import cv2
-import face_recognition
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import time
+from typing import List, Dict
+
+import cv2
+import numpy as np
 from PIL import Image, ImageTk
 import pyttsx3
-import datetime
 
-import threading
-
-# --- Configuration ---
-# IMPORTANT: For Gmail, you may need to create an "App Password"
-# Go to your Google Account -> Security -> 2-Step Verification -> App Passwords
-SENDER_EMAIL = "classroom_sentry_system@gmail.com"  # Your email address
-SENDER_PASSWORD = "arky ugvf tmep gpkw"  # Your email app password
-RECIPIENT_EMAIL = "ee.anoop@gmail.com"  # Where to send the report
 
 class StudentRegisterApp:
-    def __init__(self, window, window_title):
+    """Simple student register using OpenCV's LBPH recognizer.
+
+    Images of students should be placed in ``student_images``.  The filename
+    (without extension) is used as the student's name.
+    """
+
+    def __init__(self, window: tk.Tk) -> None:
         self.window = window
-        self.window.title(window_title)
+        self.window.title("Automated Student Register")
 
-        # --- State Variables ---
-        self.known_face_encodings = []
-        self.known_face_names = []
-        self.sentry_mode = False
-        self.sentry_thread = None
-        self.sentry_stop_event = threading.Event()
-        self.frame_lock = threading.Lock()
-        self.latest_frame = None
-        
-        # --- Load Student Data ---
-        self.load_student_images()
+        # --- Setup models ---
+        self.detector = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
 
-        # --- Setup Video Capture ---
-        self.video_capture = cv2.VideoCapture(0) # 0 is usually the default webcam
+        self.names: List[str] = []
+        self.image_paths: Dict[str, str] = {}
+        self._train_recognizer()
 
-        # --- Setup Text-to-Speech ---
-        self.tts_engine = pyttsx3.init()
+        # --- Video capture and UI ---
+        self.cap = cv2.VideoCapture(0)
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
 
-        # --- Create UI Elements ---
-        self.canvas = tk.Canvas(window, width=self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH), height=self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.canvas = tk.Canvas(window, width=width, height=height)
         self.canvas.pack()
 
-        # --- Buttons ---
-        btn_frame = tk.Frame(window, bg="white")
-        btn_frame.pack(fill=tk.X, expand=True)
+        btn_frame = tk.Frame(window)
+        btn_frame.pack(fill=tk.X)
 
-        self.btn_register = tk.Button(btn_frame, text="Take Register", width=20, command=self.run_register_call)
-        self.btn_register.pack(side=tk.LEFT, expand=True, padx=5, pady=5)
-        
-        self.btn_sentry = tk.Button(btn_frame, text="Toggle Sentry Mode", width=20, command=self.toggle_sentry_mode)
-        self.btn_sentry.pack(side=tk.RIGHT, expand=True, padx=5, pady=5)
-        
-        # Start the video feed loop
-        self.update()
-        self.window.mainloop()
+        self.start_btn = tk.Button(btn_frame, text="Start roll call", command=self.start_roll_call)
+        self.start_btn.pack(side=tk.LEFT, expand=True, padx=5, pady=5)
 
-    def load_student_images(self):
-        """Loads face encodings from images in the 'student_images' folder."""
+        self.end_btn = tk.Button(btn_frame, text="End roll call", command=self.end_roll_call, state=tk.DISABLED)
+        self.end_btn.pack(side=tk.RIGHT, expand=True, padx=5, pady=5)
+
+        self.tts = pyttsx3.init()
+        self.capturing = False
+        self.recognized: set[str] = set()
+        self.last_unauthorized = 0.0
+
+        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self._update_frame()
+
+    # ------------------------------------------------------------------
+    def _train_recognizer(self) -> None:
+        """Load images from disk and train the LBPH recognizer."""
         path = "student_images"
         if not os.path.exists(path):
             os.makedirs(path)
-            messagebox.showinfo("Setup", "Created 'student_images' folder. Please add student photos to it.")
+            messagebox.showinfo(
+                "Setup", "Created 'student_images' folder. Add student photos and restart."
+            )
             return
 
-        print("Loading known faces...")
-        for filename in os.listdir(path):
-            if filename.endswith((".jpg", ".png", ".jpeg")):
-                image_path = os.path.join(path, filename)
-                try:
-                    student_image = face_recognition.load_image_file(image_path)
-                    # Use the first face found in the image
-                    face_encodings = face_recognition.face_encodings(student_image)
-                    if face_encodings:
-                        encoding = face_encodings[0]
-                        self.known_face_encodings.append(encoding)
-                        # Get student name from filename (e.g., "Elon_Musk.jpg" -> "Elon Musk")
-                        self.known_face_names.append(os.path.splitext(filename)[0].replace("_", " "))
-                    else:
-                        print(f"Warning: No face found in {filename}. Skipping.")
-                except Exception as e:
-                    print(f"Error loading {filename}: {e}")
-        print(f"Loaded {len(self.known_face_names)} known faces.")
-
-    def run_register_call(self):
-        """Identifies students present, calls out their names, and emails a report."""
-        self.btn_register.config(state=tk.DISABLED, text="Registering...")
-        # Run face recognition in a separate thread to avoid freezing the UI
-        threading.Thread(target=self.process_register_call).start()
-
-    def process_register_call(self):
-        # Grab a single frame of video
-        ret, frame = self.video_capture.read()
-        if not ret:
-            messagebox.showerror("Error", "Failed to capture image from webcam.")
-            self.btn_register.config(state=tk.NORMAL, text="Take Register")
-            return
-
-        # Find all faces in the current frame
-        face_locations = face_recognition.face_locations(frame)
-        face_encodings = face_recognition.face_encodings(frame, face_locations)
-
-        present_students = set()
-        for face_encoding in face_encodings:
-            matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
-            name = "Unknown"
-            if True in matches:
-                first_match_index = matches.index(True)
-                name = self.known_face_names[first_match_index]
-            
-            if name != "Unknown":
-                present_students.add(name)
-
-        # Call out names of present students
-        if present_students:
-            self.speak(f"Register call. The following {len(present_students)} students are present:")
-            for student in sorted(list(present_students)):
-                self.speak(student)
-        else:
-            self.speak("No students were recognized.")
-            
-        # Send email report
-        absent_students = set(self.known_face_names) - present_students
-        self.send_email(list(present_students), list(absent_students))
-
-        # Re-enable the button
-        self.window.after(0, self.enable_register_button)
-
-    def enable_register_button(self):
-        self.btn_register.config(state=tk.NORMAL, text="Take Register")
-
-    def toggle_sentry_mode(self):
-        """Activates or deactivates sentry mode."""
-        self.sentry_mode = not self.sentry_mode
-        if self.sentry_mode:
-            self.btn_sentry.config(relief=tk.SUNKEN, text="Sentry Mode: ON")
-            print("Sentry Mode Activated.")
-            self.sentry_stop_event.clear()
-            self.sentry_thread = threading.Thread(target=self.sentry_worker, daemon=True)
-            self.sentry_thread.start()
-            self.speak("Sentry mode activated.")
-        else:
-            self.sentry_stop_event.set()
-            self.btn_sentry.config(relief=tk.RAISED, text="Toggle Sentry Mode")
-            print("Sentry Mode Deactivated.")
-            self.speak("Sentry mode deactivated.")
-
-    def sentry_worker(self):
-        """Processes frames for faces in a background thread."""
-        last_seen_unknown = 0
-        while not self.sentry_stop_event.is_set():
-            frame_to_process = None
-            with self.frame_lock:
-                if self.latest_frame is not None:
-                    # Work on a copy
-                    frame_to_process = self.latest_frame.copy()
-
-            if frame_to_process is None:
-                time.sleep(0.05) # Wait for a frame
+        faces: List[np.ndarray] = []
+        labels: List[int] = []
+        for idx, filename in enumerate(sorted(os.listdir(path))):
+            if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
+            name = os.path.splitext(filename)[0]
+            img_path = os.path.join(path, filename)
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                print(f"Unable to read {filename}, skipping")
+                continue
+            detected = self.detector.detectMultiScale(img)
+            if len(detected) == 0:
+                print(f"No face found in {filename}, skipping")
+                continue
+            x, y, w, h = detected[0]
+            faces.append(img[y : y + h, x : x + w])
+            labels.append(idx)
+            self.names.append(name)
+            self.image_paths[name] = img_path
 
-            # Find all faces in the current frame
-            face_locations = face_recognition.face_locations(frame_to_process)
-            face_encodings = face_recognition.face_encodings(frame_to_process, face_locations)
+        if faces:
+            self.recognizer.train(faces, np.array(labels))
+        else:
+            messagebox.showwarning("Warning", "No student images found for training")
 
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
-                name = "Unknown"
-                color = (0, 0, 255) # Red for unknown
+    # ------------------------------------------------------------------
+    def start_roll_call(self) -> None:
+        self.recognized.clear()
+        self.capturing = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.end_btn.config(state=tk.NORMAL)
 
-                if True in matches:
-                    first_match_index = matches.index(True)
-                    name = self.known_face_names[first_match_index]
-                    color = (0, 255, 0) # Green for known
-                elif time.time() - last_seen_unknown > 5: # Avoid spamming
-                    self.speak("Unauthorized person detected")
-                    last_seen_unknown = time.time()
+    # ------------------------------------------------------------------
+    def end_roll_call(self) -> None:
+        self.capturing = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.end_btn.config(state=tk.DISABLED)
 
-                # Draw a box around the face
-                cv2.rectangle(self.latest_frame, (left, top), (right, bottom), color, 2)
-                # Draw a label with a name below the face
-                cv2.rectangle(self.latest_frame, (left, bottom - 25), (right, bottom), color, cv2.FILLED)
-                font = cv2.FONT_HERSHEY_DUPLEX
-                cv2.putText(self.latest_frame, name, (left + 6, bottom - 6), font, 0.5, (255, 255, 255), 1)
+        present = sorted(self.recognized)
+        absent = [name for name in self.names if name not in self.recognized]
 
-    def update(self):
-        """Main loop to update the video feed and run detection."""
-        ret, frame = self.video_capture.read()
+        result = tk.Toplevel(self.window)
+        result.title("Roll call results")
+
+        tk.Label(result, text="Present", font=("Arial", 14, "bold")).pack()
+        present_frame = tk.Frame(result)
+        present_frame.pack()
+        self._populate_results(present_frame, present)
+
+        tk.Label(result, text="Absent", font=("Arial", 14, "bold")).pack()
+        absent_frame = tk.Frame(result)
+        absent_frame.pack()
+        self._populate_results(absent_frame, absent)
+
+    # ------------------------------------------------------------------
+    def _populate_results(self, parent: tk.Frame, names: List[str]) -> None:
+        images: List[ImageTk.PhotoImage] = []
+        for name in names:
+            path = self.image_paths.get(name)
+            if not path:
+                continue
+            img = Image.open(path)
+            img.thumbnail((80, 80))
+            photo = ImageTk.PhotoImage(img)
+            images.append(photo)
+            row = tk.Frame(parent)
+            row.pack(anchor=tk.W, padx=5, pady=2)
+            tk.Label(row, image=photo).pack(side=tk.LEFT)
+            tk.Label(row, text=name).pack(side=tk.LEFT, padx=5)
+        parent.images = images  # prevent garbage collection
+
+    # ------------------------------------------------------------------
+    def _update_frame(self) -> None:
+        ret, frame = self.cap.read()
         if ret:
-            with self.frame_lock:
-                # Convert the image from BGR (OpenCV default) to RGB for face_recognition
-                self.latest_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            display = frame.copy()
+            if self.capturing and self.names:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = self.detector.detectMultiScale(gray, 1.1, 4)
+                for (x, y, w, h) in faces:
+                    roi = gray[y : y + h, x : x + w]
+                    label, confidence = self.recognizer.predict(roi)
+                    if confidence < 80:
+                        name = self.names[label]
+                        if name not in self.recognized:
+                            self.recognized.add(name)
+                            self._speak(name)
+                        color = (0, 255, 0)
+                        cv2.putText(display, name, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    else:
+                        color = (0, 0, 255)
+                        if time.time() - self.last_unauthorized > 5:
+                            self._speak("unauthorized")
+                            self.last_unauthorized = time.time()
+                        cv2.putText(display, "Unknown", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
 
-            # Convert the frame to a PhotoImage for Tkinter
-            self.photo = ImageTk.PhotoImage(image=Image.fromarray(self.latest_frame))
+            image = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+            self.photo = ImageTk.PhotoImage(Image.fromarray(image))
             self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
 
-        # Call update again after 15ms
-        self.window.after(15, self.update)
+        self.window.after(30, self._update_frame)
 
-    def send_email(self, present_list, absent_list):
-        """Formats and sends an email with the attendance report."""
-        now = datetime.datetime.now()
-        subject = f"Attendance Report - {now.strftime('%Y-%m-%d %H:%M')}"
-        
-        body = f"""
-        <html>
-        <body>
-            <h2>Attendance Report</h2>
-            <p>Report generated on {now.strftime('%A, %B %d, %Y at %I:%M %p')}.</p>
-            
-            <h3>✅ Present Students ({len(present_list)})</h3>
-            <ul>
-                {''.join(f'<li>{name}</li>' for name in sorted(present_list))}
-            </ul>
-
-            <h3>❌ Absent Students ({len(absent_list)})</h3>
-            <ul>
-                {''.join(f'<li>{name}</li>' for name in sorted(absent_list))}
-            </ul>
-        </body>
-        </html>
-        """
-        
+    # ------------------------------------------------------------------
+    def _speak(self, text: str) -> None:
         try:
-            msg = MIMEMultipart()
-            msg['From'] = SENDER_EMAIL
-            msg['To'] = RECIPIENT_EMAIL
-            msg['Subject'] = subject
-            msg.attach(MIMEText(body, 'html'))
-            
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            text = msg.as_string()
-            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, text)
-            server.quit()
-            
-            print(f"Email report sent successfully to {RECIPIENT_EMAIL}")
-            messagebox.showinfo("Success", "Attendance report sent successfully!")
+            self.tts.say(text)
+            self.tts.runAndWait()
+        except Exception as exc:
+            print(f"TTS error: {exc}")
 
-        except Exception as e:
-            print(f"Failed to send email: {e}")
-            messagebox.showerror("Email Error", f"Failed to send email. Check credentials and connection.\nError: {e}")
-
-    def speak(self, text):
-        """Uses the TTS engine to speak the given text."""
-        try:
-            self.tts_engine.say(text)
-            self.tts_engine.runAndWait()
-        except Exception as e:
-            print(f"TTS Error: {e}")
-            
-    def on_closing(self):
-        """Release the webcam and destroy the window when closing."""
-        print("Releasing resources...")
-        self.video_capture.release()
+    # ------------------------------------------------------------------
+    def on_closing(self) -> None:
+        self.capturing = False
+        self.cap.release()
         self.window.destroy()
 
+
 if __name__ == "__main__":
-    app = StudentRegisterApp(tk.Tk(), "Automated Student Register 📸")
+    root = tk.Tk()
+    app = StudentRegisterApp(root)
+    root.mainloop()
