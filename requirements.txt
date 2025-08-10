@@ -1,5 +1,3 @@
-opencv-python
-face-recognition
-dlib==19.24.4
+opencv-contrib-python
 Pillow
 pyttsx3
